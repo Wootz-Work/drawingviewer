@@ -446,7 +446,7 @@
         const DEMO = !!params.get("demo") || (!params.get("url") && !params.get("versions") && location.protocol === "file:");
         const DATA = DEMO ? demoData() : readInput();
         const V = DATA.versions;
-        const S = { view: DATA.currentIndex, base: null, mode: "swipe", zoom: 1, swipe: 50, drawer: false };
+        const S = { view: DATA.currentIndex, base: null, mode: "swipe", zoom: 1, swipe: 50, drawer: false, fit: true };  // fit: keep the whole page in view
         const latestIndex = V.length - 1;
         const CUR = DATA.currentIndex;
         const label = (i) => V[i].rev + (i === CUR && V[i].rev !== "Current" ? " (current)" : "");
@@ -479,7 +479,7 @@
                   <span class="menuwrap"><button class="icon-btn" data-act="more" aria-haspopup="menu" aria-expanded="false" aria-label="More">${ic("dots")}</button>
                     <div class="menu" id="more" role="menu" hidden>
                       <a role="menuitem" href="${esc(V[S.view].url)}" target="_blank" rel="noopener">${ic("ext")}Open ${esc(V[S.view].rev)} in a new tab</a>
-                      <a role="menuitem" href="${esc(V[S.view].url)}" download>${ic("dl")}Download ${esc(V[S.view].rev)}</a>
+                      <button role="menuitem" data-act="download">${ic("dl")}Download ${esc(V[S.view].rev)}</button>
                     </div></span>
                 </span>`;
             if (S.base === null) {
@@ -674,14 +674,16 @@
         function showFallback(v, err, comparing) {
             rendered = 0;
             const id = driveId(v.url);
-            const src = id ? `https://drive.google.com/file/d/${encodeURIComponent(id)}/preview` : v.url;
+            const src = id ? `https://drive.google.com/file/d/${encodeURIComponent(id)}/preview`
+                : v.url.includes("#") ? v.url : v.url + "#view=Fit&zoom=page-fit";   // whole page in the browser's PDF viewer
             viewer.replaceChildren(el("iframe"), el("div", "note",
                 `${comparing ? "Can’t compare" : "Showing the browser’s viewer"}: ${esc(err.message)}.${comparing ? "" : " Zoom and compare need the file to load here."}`));
             const f = viewer.querySelector("iframe"); f.src = src; f.title = v.rev;
         }
 
         /* ================= zoom ================= */
-        function setZoom(next, cx = scroll.clientWidth / 2, cy = scroll.clientHeight / 2) {
+        function setZoom(next, cx = scroll.clientWidth / 2, cy = scroll.clientHeight / 2, keepFit = false) {
+            S.fit = keepFit;
             next = Math.min(6, Math.max(0.2, next));
             const pct = $("pct"); if (pct) pct.textContent = `${Math.round(next * 100)}%`;
             if (!rendered) { S.zoom = next; return; }
@@ -719,12 +721,21 @@
             setZoom(pinch.z * spread(e.touches) / pinch.d, (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left, (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top);
         }, { passive: false });
         scroll.addEventListener("touchend", () => { pinch = null; });
-        new ResizeObserver(() => { if (rendered && Math.abs(paneW() - fitWidth) > 4) setZoom(S.zoom); }).observe(scroll);
+        let fitHeight = 0, resizeTimer = null;
+        new ResizeObserver(() => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(async () => {
+                if (!rendered) return;
+                if (S.fit) {
+                    if (Math.abs(paneW() - fitWidth) > 4 || Math.abs(paneH() - fitHeight) > 4) { fitHeight = paneH(); setZoom(await fitPage(), undefined, undefined, true); }
+                } else if (Math.abs(paneW() - fitWidth) > 4) setZoom(S.zoom);
+            }, 120);
+        }).observe(scroll);
 
         /* ================= actions ================= */
         async function refresh(refit) {
             renderBar(); renderDrawer();
-            if (refit) { S.zoom = await fitPage(); const p = $("pct"); if (p) p.textContent = `${Math.round(S.zoom * 100)}%`; }
+            if (refit) { S.fit = true; fitHeight = paneH(); S.zoom = await fitPage(); const p = $("pct"); if (p) p.textContent = `${Math.round(S.zoom * 100)}%`; }
             await draw();
         }
         function startCompare(i) {
@@ -742,12 +753,13 @@
             else if (a === "latest") { S.view = CUR; refresh(true); }
             else if (a === "history") { S.drawer = !S.drawer; renderBar(); renderDrawer(); }
             else if (a === "fullscreen") toggleFull();
+            else if (a === "download") { $("more").hidden = true; downloadFile(V[S.view]); }
             else if (a === "more") { const m = $("more"); m.hidden = !m.hidden; t.setAttribute("aria-expanded", String(!m.hidden)); }
             else if (t.dataset.mode) { S.mode = t.dataset.mode; refresh(true); }
             else if (t.dataset.z) {
                 const z = t.dataset.z;
                 if (z === "in") setZoom(S.zoom * 1.25); else if (z === "out") setZoom(S.zoom / 1.25);
-                else if (z === "width") setZoom(1); else fitPage().then((f) => setZoom(f));
+                else if (z === "width") setZoom(1); else fitPage().then((f) => { fitHeight = paneH(); setZoom(f, undefined, undefined, true); });
             }
             else if (t.dataset.view !== undefined) { S.view = +t.dataset.view; S.base = null; refresh(true); }
             else if (t.dataset.cmp !== undefined) startCompare(+t.dataset.cmp);
@@ -760,6 +772,27 @@
             }
             if (e.target.id === "baseSel") { S.base = +e.target.value; refresh(false); }
         });
+        /* ================= download ================= */
+        // Files on other sites (Glide storage, Cloudinary) ignore the download attribute and open instead,
+        // so fetch the file and save it from here. If its server doesn't allow that, open it in a new tab.
+        function fileName(v) {
+            let n = ""; try { n = decodeURIComponent(new URL(v.url).pathname.split("/").pop() || ""); } catch { }
+            if (!n || !/\.[a-z0-9]{2,5}$/i.test(n)) n = (v.rev || "drawing") + ".pdf";
+            return n.replace(/[\\/:*?"<>|]+/g, "_");
+        }
+        async function downloadFile(v) {
+            busy(true, "Preparing download…");
+            try {
+                const { data, declared } = await fetchBytes(v.url);
+                const href = URL.createObjectURL(new Blob([data], { type: declared || "application/octet-stream" }));
+                const a = document.createElement("a"); a.href = href; a.download = fileName(v);
+                document.body.append(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(href), 10000);
+            } catch {
+                window.open(v.url, "_blank", "noopener");
+            } finally { busy(false); }
+        }
+
         /* ================= full screen ================= */
         // Uses the browser's full screen. Inside an embed that doesn't allow it (iframe without
         // allow="fullscreen"), it opens the same view in a new tab instead.
@@ -778,7 +811,7 @@
         }
         async function onFullChange() {
             renderBar();
-            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));  // let the layout settle
+            await new Promise((r) => setTimeout(r, 80));  // let the layout settle
             S.zoom = await fitPage(); await draw();
             const p = $("pct"); if (p) p.textContent = `${Math.round(S.zoom * 100)}%`;
         }
@@ -851,6 +884,8 @@ Drawing updated (Reason: First issue) ",
                 return;
             }
             viewer.replaceChildren(scroll);
+            // Let the embed settle to its real size (up to ~0.5 s) before fitting the page
+            for (let i = 0; i < 10 && scroll.clientHeight < 50; i++) await new Promise((r) => setTimeout(r, 50));
             await refresh(true);
         })();
     </script>
