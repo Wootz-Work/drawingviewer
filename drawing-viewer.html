@@ -169,7 +169,10 @@
 
     <script>
         /* ================= input ================= */
+        // Parameters can come after ? or after # (or both). After # they never reach the server, so a long
+        // version log can't hit GitHub Pages' address-length limit. "#?url=…" works too.
         const params = new URLSearchParams(location.search);
+        new URLSearchParams(location.hash.replace(/^#\??/, "")).forEach((v, k) => { if (!params.has(k)) params.set(k, v); });
         const API_BASE = (params.get("api") || "https://po-assemblies.onrender.com").replace(/\/$/, "");
         const PROXY = params.get("proxy") || "";
 
@@ -837,6 +840,8 @@ Drawing updated (Reason: First issue) ",
 }`;
             return buildData(readEntries(raw), uri(r1), "", "");
         }
+
+        window.addEventListener("hashchange", () => location.reload());
 
         /* ================= start ================= */
         (async function init() {
