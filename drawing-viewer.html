@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Drawing</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <style>
+        /*
+         * Drawing viewer with version history and comparison. Embed in Glide with a Web Embed component.
+         *
+         * URL parameters
+         *   url       the current drawing (PDF or image). Required. It may or may not be approved.
+         *   approved  the version log from Glide, as JSON. Both formats work, and so does the
+         *             slightly broken JSON a Glide template produces (leading comma, line breaks, a
+         *             missing or trailing comma):
+         *               new: {"Version":"v1","Drawing":"https://…","Uploaded By":"…","Time Stamp":"11/21/2026, 5:36:13 PM",
+         *                     "Approved By":"…","Approved Time Stamp":"…","log":"Changes summary: …"}
+         *               old: {"Version":"v0","Previous Drawing":"https://…","By":"…","Time Stamp":"…","log":"…"}
+         *             If the current url matches a version's file, it's shown as that version.
+         *             Otherwise it's the current drawing: "Pending approval" when the log has approvals,
+         *             no status for old drawings from before approvals.
+         *   status    optional: the current drawing's approval status from Glide, shown as is.
+         *   rev       optional label for the current drawing when it isn't in the log.
+         *   proxy     optional CORS proxy prefix; the file URL is appended, encoded.
+         *   api       service used for Google Drive links (default: the PO Assemblies service).
+         *   demo=1    built-in sample drawings, for trying the viewer.
+         */
+        :root {
+            --bg: #161616;
+            --panel: #1c1c1e;
+            --field: #232326;
+            --menu: #26262a;
+            --line: #2c2c31;
+            --line-strong: #38383e;
+            --text: #ededef;
+            --muted: #a1a1aa;
+            --faint: #85858e;
+            --primary: #e0a526;
+            --primary-text: #1d1500;
+            --hover: #2c2c31;
+            --viewer: #0f0f10;
+            --old: #d6453d;
+            --new: #2f6fdb;
+            color-scheme: dark;
+        }
+
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0; background: var(--bg); color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+            font-size: 14px; display: flex; flex-direction: column;
+        }
+        button, select { font: inherit; color: inherit; }
+        button { cursor: pointer; }
+        :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+        :fullscreen .doc, :-webkit-full-screen .doc { border-radius: 0; border: 0; }
+        .doc { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--panel); position: relative; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
+
+        /* ---------- toolbar ---------- */
+        .bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+        .btn { height: 34px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--field); font-size: 13.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+        .btn:hover { border-color: #55555c; }
+        .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
+        .sel { position: relative; display: inline-flex; }
+        .sel select { appearance: none; height: 34px; padding: 0 32px 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--field); font-size: 13.5px; font-weight: 600; cursor: pointer; max-width: 260px; text-overflow: ellipsis; }
+        .sel::after { content: ""; position: absolute; right: 12px; top: 50%; width: 6px; height: 6px; border-right: 1.6px solid var(--muted); border-bottom: 1.6px solid var(--muted); transform: translateY(-70%) rotate(45deg); pointer-events: none; }
+        .vs { color: var(--muted); font-size: 13px; }
+        .spacer { flex: 1; }
+        .tools { display: inline-flex; align-items: center; gap: 2px; }
+        .icon-btn { height: 32px; min-width: 32px; padding: 0 6px; border: none; border-radius: 7px; background: transparent; color: var(--muted); display: inline-grid; place-items: center; position: relative; }
+        .icon-btn:hover, .icon-btn[aria-expanded="true"], .icon-btn[aria-pressed="true"] { background: var(--hover); color: var(--text); }
+        .pct { min-width: 52px; font-size: 13px; font-variant-numeric: tabular-nums; }
+        .badge { position: absolute; top: 2px; right: 0; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: var(--primary); color: var(--primary-text); font-size: 10px; font-weight: 700; line-height: 15px; }
+        .seg { display: inline-flex; background: var(--field); border: 1px solid var(--line-strong); border-radius: 8px; padding: 2px; }
+        .seg button { height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: none; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+        .seg button[aria-pressed="true"] { background: #3a3a40; color: var(--text); }
+        .menuwrap { position: relative; display: inline-flex; }
+        .menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; min-width: 200px; padding: 6px; background: var(--menu); border: 1px solid var(--line-strong); border-radius: 10px; box-shadow: 0 16px 40px rgba(0,0,0,.55); }
+        .menu[hidden] { display: none; }
+        .menu a, .menu button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 6px; background: none; color: var(--text); font-size: 13.5px; text-decoration: none; text-align: left; }
+        .menu a:hover, .menu button:hover { background: var(--hover); }
+
+        /* ---------- compare notes / banners ---------- */
+        .sub { display: flex; align-items: center; gap: 8px 16px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: #19191b; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+        .sub[hidden] { display: none; }
+        .legend { display: inline-flex; gap: 14px; }
+        .legend span { display: inline-flex; align-items: center; gap: 6px; }
+        .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+        .notes { flex: 1 1 320px; min-width: 0; color: var(--text); }
+        .notes b { color: var(--primary); font-weight: 600; margin-right: 6px; }
+        .notes .n { display: block; margin: 2px 0; }
+        .lnk { background: none; border: 0; padding: 0; color: var(--primary); font-weight: 600; font-size: 12.5px; }
+        .lnk:hover { text-decoration: underline; }
+
+        /* ---------- viewer ---------- */
+        .viewer { flex: 1; min-height: 0; background: var(--viewer); position: relative; }
+        .viewer iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
+        .empty { padding: 40px 24px; text-align: center; color: var(--muted); line-height: 1.5; }
+        .empty a { color: var(--primary); }
+        .scroll { position: absolute; inset: 0; overflow: auto; touch-action: pan-x pan-y; }
+        .pages { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 16px; width: max-content; min-width: 100%; }
+        .row { display: flex; gap: 16px; align-items: flex-start; }
+        .cell { display: flex; flex-direction: column; gap: 6px; }
+        .cap { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+        .tag { font-size: 11.5px; font-weight: 700; padding: 2px 7px; border-radius: 5px; background: #2a2a2e; color: var(--text); }
+        .page { position: relative; background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.45); user-select: none; }
+        .page canvas { display: block; }
+        .page .top { position: absolute; left: 0; top: 0; }
+        .missing { display: grid; place-items: center; color: #777; font-size: 13px; background: #f4f4f4; }
+        .handle { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px solid var(--primary); cursor: ew-resize; z-index: 3; }
+        .handle::after { content: ""; position: absolute; top: 50%; left: -14px; width: 26px; height: 26px; margin-top: -13px; border-radius: 50%; background: var(--primary); box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+        .stag { position: absolute; top: 10px; z-index: 3; font-size: 11.5px; font-weight: 700; padding: 3px 8px; border-radius: 5px; background: rgba(20,20,20,.85); color: #fff; }
+        .busy { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5; padding: 5px 12px; border-radius: 999px; background: var(--menu); color: var(--muted); font-size: 12px; border: 1px solid var(--line-strong); }
+        .note { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 5; padding: 7px 10px; border-radius: 8px; background: var(--menu); color: var(--muted); font-size: 12px; text-align: center; }
+
+        /* pdf.js text layer so text can be selected and copied */
+        .textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1; text-align: initial; opacity: 1; forced-color-adjust: none; transform-origin: 0 0; z-index: 2; }
+        .textLayer span, .textLayer br { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; }
+        .textLayer ::selection { background: rgba(224, 165, 38, .35); }
+        .textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: -1; cursor: default; user-select: none; }
+
+        /* ---------- history drawer ---------- */
+        .drawer { position: absolute; top: 0; right: 0; bottom: 0; width: min(360px, 92%); z-index: 15; background: var(--panel); border-left: 1px solid var(--line-strong); box-shadow: -18px 0 40px rgba(0,0,0,.45); display: flex; flex-direction: column; transform: translateX(105%); transition: transform .22s ease; visibility: hidden; }
+        .drawer.open { transform: none; visibility: visible; }
+        .dhead { display: flex; align-items: center; padding: 12px 12px 12px 16px; border-bottom: 1px solid var(--line); font-weight: 650; }
+        .dbody { flex: 1; overflow: auto; padding: 8px 16px 20px; }
+        .dsec { font-size: 12px; color: var(--faint); margin: 14px 0 6px; }
+        .ver { padding: 12px 0; border-bottom: 1px solid var(--line); }
+        .ver:last-child { border-bottom: 0; }
+        .vh { display: flex; align-items: center; gap: 8px; }
+        .vh .meta { color: var(--faint); font-size: 12px; margin-left: auto; text-align: right; }
+        .ver.viewing .tag { background: var(--primary); color: var(--primary-text); }
+        .ver p { margin: 6px 0 0; font-size: 13px; color: #d6d6d8; white-space: pre-wrap; }
+        .ver .acts { display: flex; gap: 14px; margin-top: 8px; }
+        .st { font-size: 12px; font-weight: 600; }
+        .pillst { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+        .pillst::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+        .pillst.ok { color: #3dc46b; background: rgba(61,196,107,.12); }
+        .pillst.pend { color: #f08a4b; background: rgba(240,138,75,.12); }
+        .st.ok { color: #3dc46b; }
+        .st.pend { color: #f08a4b; }
+        .st.bad { color: #ef6b5b; }
+        .st.neutral { color: var(--muted); font-weight: 500; }
+        .pillst.bad { color: #ef6b5b; background: rgba(239,107,91,.12); }
+        .pillst.neutral { color: var(--muted); background: #2a2a2e; }
+        .ver .up { font-size: 12px; color: var(--faint); margin-top: 4px; }
+        .sub .st { margin-left: 6px; }
+        .log { display: flex; gap: 10px; padding: 8px 0; font-size: 13px; }
+        .log .when { color: var(--faint); font-size: 12px; white-space: nowrap; min-width: 86px; }
+        .log .what { color: #d6d6d8; white-space: pre-wrap; }
+        .log .who { color: var(--muted); }
+        @media (prefers-reduced-motion: reduce) { .drawer { transition: none; } }
+        @media (max-width: 640px) { .sel select { max-width: 150px; } .hide-sm { display: none; } }
+    </style>
+</head>
+
+<body>
+    <section class="doc" aria-label="Drawing viewer">
+        <div class="bar" id="bar"></div>
+        <div class="sub" id="sub" hidden></div>
+        <div class="viewer" id="viewer"><div class="empty">Loading…</div></div>
+        <aside class="drawer" id="drawer" aria-label="Version history"></aside>
+    </section>
+
+    <script>
+        /* ================= input ================= */
+        const params = new URLSearchParams(location.search);
+        const API_BASE = (params.get("api") || "https://po-assemblies.onrender.com").replace(/\/$/, "");
+        const PROXY = params.get("proxy") || "";
+
+        const $ = (id) => document.getElementById(id);
+        const tryJSON = (s) => { try { return JSON.parse(s); } catch { return null; } };
+        const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+        // Reads a field by any of several names, ignoring case: {Rev: …} = {rev: …} = {revision: …}
+        function field(o, ...names) {
+            const keys = Object.keys(o || {});
+            for (const n of names) {
+                const k = keys.find((x) => x.toLowerCase().replace(/[^a-z]/g, "") === n);
+                if (k && o[k] != null && String(o[k]).trim() !== "") return String(o[k]).trim();
+            }
+            return "";
+        }
+        function revFromUrl(u) {
+            let s = u; try { s = decodeURIComponent(u); } catch { }
+            const m = s.match(/(?:^|[_\-\s/])REV[\s_-]?([A-Za-z0-9]{1,4})(?=[._\-\s?#]|$)/i);
+            return m ? "REV" + m[1].toUpperCase() : "";
+        }
+        // "1" -> "V1", "v0" -> "V0"; anything else (REV2, REVA) as given
+        function versionLabel(raw) {
+            const s = String(raw || "").trim();
+            if (/^\d+$/.test(s)) return "V" + s;
+            if (/^v\d+$/i.test(s)) return s.toUpperCase();
+            return s;
+        }
+        // Sort key from a version label: V3 -> 3, REV12 -> 12, REVB -> 2
+        function versionKey(label) {
+            const n = String(label).match(/(\d+)/);
+            if (n) return +n[1];
+            const l = String(label).replace(/^rev/i, "").match(/[A-Za-z]/);
+            return l ? l[0].toUpperCase().charCodeAt(0) - 64 : NaN;
+        }
+        // "11/21/2026, 5:33:53 PM" (anything stuck on after it is ignored), or ISO dates
+        function parseDate(s) {
+            if (!s) return NaN;
+            const m = String(s).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?)?/i);
+            if (m) {
+                let h = +(m[4] || 0); const ap = (m[7] || "").toUpperCase();
+                if (ap === "PM" && h < 12) h += 12; if (ap === "AM" && h === 12) h = 0;
+                return new Date(+m[3], +m[1] - 1, +m[2], h, +(m[5] || 0), +(m[6] || 0)).getTime();
+            }
+            return Date.parse(String(s).replace(/^(\d{4}-\d\d-\d\d) /, "$1T"));
+        }
+        function niceDate(s) {
+            const t = parseDate(s); if (isNaN(t)) return s || "";
+            const d = new Date(t), now = new Date();
+            const hasTime = /\d:\d/.test(s);
+            const day = d.toDateString() === now.toDateString() ? "Today" : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" });
+            return hasTime ? `${day}, ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).toLowerCase()}` : day;
+        }
+        // "vineet.more@wootz.work" -> "Vineet More" (also drops anything glued onto the end of the address)
+        function person(s) {
+            s = String(s || "").trim();
+            if (!s.includes("@")) return s;
+            return s.split("@")[0].split(/[._-]+/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+        }
+        // "Changes summary:\n\nDrawing updated (Reason: Internal Update)" -> "Drawing updated (Reason: Internal Update)"
+        // Empty reasons and reasons that are just a row ID are left out.
+        function cleanNote(s) {
+            return String(s || "")
+                .replace(/^\s*changes summary:\s*/i, "")
+                .replace(/\s*\(Reason:\s*\)/gi, "")
+                .replace(/\s*\(Reason:\s*[A-Za-z0-9_.\-]{16,}\s*\)/g, "")
+                .replace(/\n{2,}/g, "\n").trim();
+        }
+        const sameUrl = (a, b) => a.split("#")[0] === b.split("#")[0];
+
+        function normEntry(o) {
+            const url = field(o, "drawing", "drawingurl", "previousdrawing", "url", "link", "file", "fileurl", "pdf", "src");
+            const approvedByRaw = field(o, "approvedby", "approver");
+            const approvedAt = field(o, "approvedtimestamp", "approvedat", "approvedon", "approveddate", "approvaltime");
+            return {
+                url,
+                rev: versionLabel(field(o, "version", "versionnumber", "versionno", "ver", "rev", "revision")) || (url ? revFromUrl(url) : ""),
+                uploadedBy: person(field(o, "uploadedby", "by", "uploader", "author", "user")),
+                uploadedAt: field(o, "timestamp", "uploadedat", "uploaded", "date", "time", "createdat"),
+                approvedBy: person(approvedByRaw),
+                approvedAt,
+                approved: !!(approvedByRaw || approvedAt),
+                note: cleanNote(field(o, "log", "note", "notes", "changes", "changesummary", "description", "comment")),
+            };
+        }
+
+        // Accepts strict JSON, or what a Glide template produces: a leading comma, line breaks inside
+        // text, a missing comma between fields, trailing commas, and no surrounding [ ].
+        function parseLoose(raw) {
+            let t = String(raw).trim();
+            let out = "", inStr = false, escp = false;
+            for (const ch of t) {                       // escape raw line breaks / tabs inside strings
+                if (inStr) {
+                    if (escp) { escp = false; out += ch; continue; }
+                    if (ch === "\\") { escp = true; out += ch; continue; }
+                    if (ch === '"') { inStr = false; out += ch; continue; }
+                    out += ch === "\n" ? "\\n" : ch === "\r" ? "" : ch === "\t" ? "\\t" : ch;
+                } else { if (ch === '"') inStr = true; out += ch; }
+            }
+            t = out
+                .replace(/^[\s,]+|[\s,]+$/g, "")                                   // leading/trailing commas
+                .replace(/("|\d|true|false|null|\}|\])(\s*\n\s*)(")/g, "$1,$2$3")   // missing comma before a new line's "key"
+                .replace(/\}\s*\{/g, "},{")                                         // }{ -> },{
+                .replace(/,(\s*[}\]])/g, "$1")                                      // trailing commas
+                .replace(/,\s*,/g, ",");
+            if (!t.startsWith("[")) t = "[" + t + "]";
+            return JSON.parse(t);
+        }
+        function readEntries(raw) {
+            if (!raw) return [];
+            let j = tryJSON(raw);
+            if (j == null) { try { j = parseLoose(raw); } catch (e) { console.warn("Could not read the versions JSON", e); return []; } }
+            if (typeof j === "string") j = tryJSON(j) || (() => { try { return parseLoose(j); } catch { return []; } })();
+            if (j && !Array.isArray(j) && typeof j === "object") {
+                const inner = j.approved || j.versions || j.data || j.items || j.rows;
+                j = Array.isArray(inner) ? inner : (field(j, "version", "drawing", "previousdrawing", "url") ? [j]
+                    : Object.entries(j).map(([k, v]) => typeof v === "string" ? { version: k, url: v } : Object.assign({ version: k }, v)));
+            }
+            return (Array.isArray(j) ? j : []).filter((x) => x && typeof x === "object").map(normEntry);
+        }
+        function buildData(entries, curUrl, curRev, curStatus) {
+            const all = entries.slice();
+            if (all.length > 1) {
+                if (all.every((v) => !isNaN(versionKey(v.rev)))) all.sort((a, b) => versionKey(a.rev) - versionKey(b.rev));
+                else if (all.every((v) => !isNaN(parseDate(v.uploadedAt || v.approvedAt)))) all.sort((a, b) => parseDate(a.uploadedAt || a.approvedAt) - parseDate(b.uploadedAt || b.approvedAt));
+            }
+            all.forEach((v, i) => { if (!v.rev) v.rev = `V${i}`; });
+            const legacy = !all.some((v) => v.approved);   // old data: no approval system yet
+            const list = all.filter((v) => v.url);           // only versions with a file can be viewed
+            let current = null;
+            if (curUrl) {
+                current = list.find((v) => sameUrl(v.url, curUrl));
+                if (!current) {
+                    current = { url: curUrl, rev: curRev || "Current", approved: false, uploadedBy: "", uploadedAt: "", approvedBy: "", approvedAt: "", note: "" };
+                    list.push(current); all.push(current);
+                }
+                current.current = true;
+                if (curStatus) current.statusText = curStatus;
+            }
+            return { versions: list, currentIndex: current ? list.indexOf(current) : list.length - 1, history: all.slice().reverse(), legacy, log: [] };
+        }
+        function readInput() {
+            const entries = readEntries(params.get("approved") || params.get("versions") || params.get("history"));
+            return buildData(entries, params.get("url") || params.get("current"), params.get("rev"), params.get("status"));
+        }
+
+        /* ================= icons & helpers ================= */
+        const ICONS = {
+            compare: '<rect x="3" y="4" width="8" height="16" rx="1.5"/><rect x="13" y="4" width="8" height="16" rx="1.5"/>',
+            zin: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/>',
+            zout: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>',
+            fit: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h10v6H7z"/>',
+            full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+            unfull: '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+            dots: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
+            history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>',
+            x: '<path d="M18 6 6 18M6 6l12 12"/>',
+            ext: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+            dl: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>',
+            swap: '<path d="M7 16V4M3 8l4-4 4 4"/><path d="M17 8v12M21 16l-4 4-4-4"/>',
+        };
+        const ic = (n) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n]}</svg>`;
+        function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+        function canvasOf(w, h) { const c = document.createElement("canvas"); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; }
+
+        /* ================= loading files ================= */
+        if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+        function driveId(u) {
+            if (!/(drive|docs)\.google\.com/.test(u)) return null;
+            const m = u.match(/\/d\/([\w-]{10,})/) || u.match(/[?&]id=([\w-]{10,})/);
+            return m ? m[1] : null;
+        }
+        function sniffType(head, declared) {
+            const starts = (...b) => b.every((x, i) => head[i] === x);
+            const txt = new TextDecoder("latin1").decode(head);
+            if (txt.includes("%PDF")) return "application/pdf";
+            if (starts(0x89, 0x50, 0x4e, 0x47)) return "image/png";
+            if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+            if (starts(0x47, 0x49, 0x46, 0x38)) return "image/gif";
+            if (starts(0x52, 0x49, 0x46, 0x46) && head[8] === 0x57 && head[9] === 0x45) return "image/webp";
+            if (/<svg[\s>]/i.test(txt)) return "image/svg+xml";
+            return declared;
+        }
+        async function fetchBytes(url) {
+            if (url.startsWith("data:")) {  // decode inline files directly (no network)
+                const comma = url.indexOf(","), headPart = url.slice(5, comma), body = url.slice(comma + 1);
+                const bytes = /;base64/i.test(headPart) ? Uint8Array.from(atob(body), (c) => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(body));
+                return { data: bytes.buffer, declared: headPart.split(";")[0] };
+            }
+            const id = driveId(url);
+            const tries = id ? [`${API_BASE}/po-assemblies/files/${encodeURIComponent(id)}`] : [url];
+            if (PROXY && !url.startsWith("data:")) tries.push(PROXY + encodeURIComponent(url));
+            let last;
+            for (const t of tries) {
+                try {
+                    const res = await fetch(t);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return { data: await res.arrayBuffer(), declared: (res.headers.get("content-type") || "").split(";")[0] };
+                } catch (e) { last = e; }
+            }
+            throw new Error(last && last.message === "Failed to fetch" ? "the file's server doesn't allow loading it here (CORS)" : (last && last.message) || "could not load");
+        }
+        const docCache = new Map();
+        function loadDoc(v) {
+            if (!docCache.has(v.url)) {
+                const p = (async () => {
+                    const { data, declared } = await fetchBytes(v.url);
+                    const type = sniffType(new Uint8Array(data, 0, Math.min(1024, data.byteLength)), declared);
+                    if (type === "application/pdf") {
+                        if (!window.pdfjsLib) throw new Error("the PDF library didn't load");
+                        const pdf = await pdfjsLib.getDocument({ data }).promise;
+                        return { type: "pdf", pdf, pages: pdf.numPages };
+                    }
+                    if (type && type.startsWith("image/")) {
+                        const src = URL.createObjectURL(new Blob([data], { type }));
+                        const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error("image didn't decode")); i.src = src; });
+                        return { type: "image", img, pages: 1 };
+                    }
+                    throw new Error(`can't show ${type || "this file type"} here`);
+                })();
+                docCache.set(v.url, p);
+                p.catch(() => docCache.delete(v.url));
+            }
+            return docCache.get(v.url);
+        }
+        async function pageAspect(doc, n = 1) {
+            if (doc.type === "image") return doc.img.naturalHeight / doc.img.naturalWidth;
+            const vp = (await doc.pdf.getPage(n)).getViewport({ scale: 1 });
+            return vp.height / vp.width;
+        }
+        // Renders page n at a CSS width; returns a white-backed canvas at device resolution
+        async function renderPage(doc, n, cssW) {
+            if (n > doc.pages) return null;
+            const ratio = window.devicePixelRatio || 1;
+            if (doc.type === "image") {
+                const cssH = cssW * doc.img.naturalHeight / doc.img.naturalWidth;
+                const c = canvasOf(cssW * ratio, cssH * ratio), ctx = c.getContext("2d");
+                ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+                ctx.drawImage(doc.img, 0, 0, c.width, c.height);
+                return { canvas: c, w: cssW, h: cssH };
+            }
+            const page = await doc.pdf.getPage(n);
+            const base = page.getViewport({ scale: 1 });
+            const vp = page.getViewport({ scale: cssW / base.width });
+            const c = canvasOf(vp.width * ratio, vp.height * ratio), ctx = c.getContext("2d");
+            ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+            await page.render({ canvasContext: ctx, viewport: vp, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null }).promise;
+            return { canvas: c, w: vp.width, h: vp.height, page, vp };
+        }
+        // Recolours dark ink to `color`, keeping white white
+        function tint(src, color) {
+            const c = canvasOf(src.width, src.height), ctx = c.getContext("2d");
+            ctx.drawImage(src, 0, 0);
+            ctx.globalCompositeOperation = "lighten";
+            ctx.fillStyle = color; ctx.fillRect(0, 0, c.width, c.height);
+            return c;
+        }
+        // Old in red, new in blue, multiplied: lines in both come out dark
+        function overlay(a, b) {
+            const w = Math.max(a ? a.width : 0, b ? b.width : 0), h = Math.max(a ? a.height : 0, b ? b.height : 0);
+            const c = canvasOf(w, h), ctx = c.getContext("2d");
+            ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+            if (a) ctx.drawImage(tint(a, "#d6453d"), 0, 0);
+            if (b) { ctx.globalCompositeOperation = "multiply"; ctx.drawImage(tint(b, "#2f6fdb"), 0, 0); }
+            return c;
+        }
+
+        /* ================= state ================= */
+        // Demo: ?demo=1, or the file opened straight from disk with no ?url= (handy for a quick look)
+        const DEMO = !!params.get("demo") || (!params.get("url") && !params.get("versions") && location.protocol === "file:");
+        const DATA = DEMO ? demoData() : readInput();
+        const V = DATA.versions;
+        const S = { view: DATA.currentIndex, base: null, mode: "swipe", zoom: 1, swipe: 50, drawer: false };
+        const latestIndex = V.length - 1;
+        const CUR = DATA.currentIndex;
+        const label = (i) => V[i].rev + (i === CUR && V[i].rev !== "Current" ? " (current)" : "");
+        // Status of a version: { cls, short (for the toolbar pill), long (for history) }
+        function statusOf(v) {
+            if (v.current && v.statusText) {
+                const t = v.statusText, cls = /chang/i.test(t) ? "bad" : (/approv/i.test(t) && !/(un|not|await|pend)/i.test(t)) ? "ok" : "pend";
+                return { cls, short: t, long: `<span class="st ${cls}">${esc(t)}</span>` };
+            }
+            if (v.approved) return { cls: "ok", short: "Approved", long: `<span class="st ok">Approved${v.approvedAt ? " " + esc(niceDate(v.approvedAt)) : ""}${v.approvedBy ? " by " + esc(v.approvedBy) : ""}</span>` };
+            if (v.current && !DATA.legacy) return { cls: "pend", short: "Pending approval", long: `<span class="st pend">Pending approval</span>` };
+            if (v.current) return { cls: "", short: "", long: "" };
+            return { cls: "neutral", short: "Earlier version", long: `<span class="st neutral">Earlier version</span>` };
+        }
+        const uploadedLine = (v) => v.uploadedAt || v.uploadedBy ? `Uploaded${v.uploadedAt ? " " + esc(niceDate(v.uploadedAt)) : ""}${v.uploadedBy ? " by " + esc(v.uploadedBy) : ""}` : "";
+
+        /* ================= toolbar ================= */
+        function renderBar() {
+            const bar = $("bar");
+            const multi = V.length > 1;
+            const opts = (sel, min, max) => V.map((v, i) => i >= min && i <= max ? `<option value="${i}" ${i === sel ? "selected" : ""}>${esc(label(i))}</option>` : "").reverse().join("");
+            const zoom = `<span class="spacer"></span>
+                <span class="tools">
+                  <button class="icon-btn" data-z="out" aria-label="Zoom out" title="Zoom out">${ic("zout")}</button>
+                  <button class="icon-btn pct" data-z="width" title="Fit to width" id="pct">${Math.round(S.zoom * 100)}%</button>
+                  <button class="icon-btn" data-z="in" aria-label="Zoom in" title="Zoom in">${ic("zin")}</button>
+                  <button class="icon-btn" data-z="page" aria-label="Fit whole page" title="Fit whole page">${ic("fit")}</button>
+                  <button class="icon-btn" data-act="fullscreen" aria-label="${isFull() ? "Exit full screen" : "Full screen"}" title="${isFull() ? "Exit full screen (Esc)" : "Full screen"}">${ic(isFull() ? "unfull" : "full")}</button>
+                  ${DATA.history.length > 1 ? `<button class="icon-btn" data-act="history" aria-label="Version history" title="Version history" aria-pressed="${S.drawer}">${ic("history")}<span class="badge">${DATA.history.length}</span></button>` : ""}
+                  <span class="menuwrap"><button class="icon-btn" data-act="more" aria-haspopup="menu" aria-expanded="false" aria-label="More">${ic("dots")}</button>
+                    <div class="menu" id="more" role="menu" hidden>
+                      <a role="menuitem" href="${esc(V[S.view].url)}" target="_blank" rel="noopener">${ic("ext")}Open ${esc(V[S.view].rev)} in a new tab</a>
+                      <a role="menuitem" href="${esc(V[S.view].url)}" download>${ic("dl")}Download ${esc(V[S.view].rev)}</a>
+                    </div></span>
+                </span>`;
+            if (S.base === null) {
+                const vv = V[S.view];
+                bar.innerHTML = `<span class="sel"><select id="verSel" aria-label="Version">${opts(S.view, 0, latestIndex)}</select></span>
+                    ${statusOf(vv).short ? `<span class="pillst ${statusOf(vv).cls}">${esc(statusOf(vv).short)}</span>` : ""}
+                    ${multi ? `<button class="btn" data-act="compare">${ic("compare")}${S.view > 0 ? "Compare with " + esc(V[S.view - 1].rev) + (!V[S.view].approved && V[S.view - 1].approved ? '<span class="hide-sm" style="font-weight:400;color:var(--muted)">, last approved</span>' : "") : "Compare versions"}</button>` : ""}${zoom}`;
+            } else {
+                bar.innerHTML = `<span class="sel"><select id="verSel" aria-label="Version">${opts(S.view, 1, latestIndex)}</select></span>
+                    <span class="vs">vs</span>
+                    <span class="sel"><select id="baseSel" aria-label="Compare with">${opts(S.base, 0, S.view - 1)}</select></span>
+                    <span class="seg" role="group" aria-label="Compare mode">
+                      ${[["side", "Side by side"], ["overlay", "Overlay"], ["swipe", "Swipe"]].map(([k, l]) => `<button data-mode="${k}" aria-pressed="${S.mode === k}">${l}</button>`).join("")}
+                    </span>
+                    <button class="btn" data-act="done">Done</button>${zoom}`;
+            }
+            renderSub();
+        }
+        function renderSub() {
+            const sub = $("sub");
+            if (S.base === null) {
+                if (S.view !== CUR) {
+                    sub.hidden = false;
+                    sub.innerHTML = `<span>You’re viewing ${esc(V[S.view].rev)}, an older version. ${statusOf(V[S.view]).long}</span><button class="lnk" data-act="latest">View current drawing</button>`;
+                } else { sub.hidden = true; sub.innerHTML = ""; }
+                return;
+            }
+            const notes = [];
+            for (let i = S.base + 1; i <= S.view; i++) if (V[i].note) notes.push(`<span class="n"><b>${esc(V[i].rev)}</b>${esc(V[i].note)}</span>`);
+            const legend = S.mode === "overlay" ? `<span class="legend"><span><i class="sw" style="background:var(--old)"></i>Only in ${esc(V[S.base].rev)}</span><span><i class="sw" style="background:var(--new)"></i>Only in ${esc(V[S.view].rev)}</span><span><i class="sw" style="background:#222;outline:1px solid #555"></i>In both</span></span>`
+                : S.mode === "swipe" ? `<span>Drag the handle to wipe between ${esc(V[S.base].rev)} and ${esc(V[S.view].rev)}.</span>` : "";
+            sub.hidden = false;
+            sub.innerHTML = `${notes.length ? `<div class="notes">${notes.join("")}</div>` : ""}${legend}`;
+            if (!notes.length && !legend) { sub.hidden = true; sub.innerHTML = ""; }
+        }
+
+        /* ================= history drawer ================= */
+        function renderDrawer() {
+            const d = $("drawer");
+            d.classList.toggle("open", S.drawer);
+            if (!S.drawer) return;
+            const items = DATA.history.map((v) => {
+                const i = V.indexOf(v), st = statusOf(v), up = uploadedLine(v);
+                const acts = i < 0 ? '<span style="font-size:12.5px;color:var(--faint)">No file attached to this version</span>'
+                    : `${i === S.view && S.base === null ? '<span style="font-size:12.5px;color:var(--faint)">Viewing</span>' : `<button class="lnk" data-view="${i}">View</button>`}
+                       ${i > 0 ? `<button class="lnk" data-cmp="${i}">Compare with ${esc(V[i - 1].rev)}</button>` : ""}`;
+                return `<div class="ver ${i === S.view ? "viewing" : ""}">
+                    <div class="vh"><span class="tag">${esc(v.rev)}</span>${v.current && v.rev !== "Current" ? '<span style="font-size:12px;color:var(--muted)">Current</span>' : ""}
+                      <span class="meta">${st.long}</span></div>
+                    ${up ? `<div class="up">${up}</div>` : ""}
+                    ${v.note ? `<p>${esc(v.note)}</p>` : ""}
+                    <div class="acts">${acts}</div></div>`;
+            }).join("");
+            d.innerHTML = `<div class="dhead">Version history<span class="spacer"></span><button class="icon-btn" data-act="history" aria-label="Close">${ic("x")}</button></div>
+                <div class="dbody"><div class="dsec">${DATA.history.length} version${DATA.history.length === 1 ? "" : "s"}${DATA.legacy ? ", from before approvals were recorded" : ""}</div>${items}</div>`;
+        }
+
+        /* ================= drawing ================= */
+        const viewer = $("viewer");
+        const scroll = el("div", "scroll"), pages = el("div", "pages");
+        scroll.append(pages);
+        let rendered = 0, drawToken = 0, renderTimer = null, fitWidth = 0, lastPageH = 0;
+        const paneW = () => Math.max(200, scroll.clientWidth - 32);
+        const paneH = () => Math.max(200, scroll.clientHeight - 32);
+        function busy(on, text = "Rendering…") {
+            let b = viewer.querySelector(".busy");
+            if (on && !b) { b = el("div", "busy", text); viewer.append(b); }
+            if (on && b) b.textContent = text;
+            if (!on && b) b.remove();
+        }
+
+        async function draw() {
+            const token = ++drawToken;
+            const vView = V[S.view], vBase = S.base !== null ? V[S.base] : null;
+            busy(true, rendered ? "Rendering…" : "Loading drawing…");
+            let dView, dBase = null;
+            try {
+                dView = await loadDoc(vView);
+                if (vBase) dBase = await loadDoc(vBase);
+            } catch (err) {
+                if (token !== drawToken) return;
+                busy(false);
+                return showFallback(vView, err, !!vBase);
+            }
+            if (token !== drawToken) return;
+            if (!viewer.contains(scroll)) viewer.replaceChildren(scroll);
+
+            const out = [];
+            const n = Math.max(dView.pages, dBase ? dBase.pages : 0);
+            if (!vBase) {
+                const w = paneW() * S.zoom;
+                for (let p = 1; p <= dView.pages; p++) {
+                    const r = await renderPage(dView, p, w);
+                    if (token !== drawToken) return;
+                    out.push(pageBox(r, true));
+                }
+            } else if (S.mode === "side") {
+                const w = (paneW() - 16) / 2 * S.zoom;
+                for (let p = 1; p <= n; p++) {
+                    const [a, b] = await Promise.all([renderPage(dBase, p, w), renderPage(dView, p, w)]);
+                    if (token !== drawToken) return;
+                    const row = el("div", "row");
+                    [[a, vBase, dBase], [b, vView, dView]].forEach(([r, v]) => {
+                        const cell = el("div", "cell");
+                        if (p === 1) cell.append(el("div", "cap", `<span class="tag">${esc(v.rev)}</span>${esc(niceDate(v.date))}`));
+                        cell.append(r ? pageBox(r) : missingBox(w, (a || b).h, v.rev, p));
+                        row.append(cell);
+                    });
+                    out.push(row);
+                }
+            } else {
+                const w = paneW() * S.zoom;
+                for (let p = 1; p <= n; p++) {
+                    const [a, b] = await Promise.all([renderPage(dBase, p, w), renderPage(dView, p, w)]);
+                    if (token !== drawToken) return;
+                    const ref = b || a;
+                    if (S.mode === "overlay") {
+                        const c = overlay(a && a.canvas, b && b.canvas);
+                        out.push(pageBox({ canvas: c, w: ref.w, h: Math.max(a ? a.h : 0, b ? b.h : 0) }));
+                    } else {
+                        out.push(swipeBox(a, b, vBase.rev, vView.rev));
+                    }
+                }
+            }
+            pages.replaceChildren(...out);
+            pages.style.zoom = "";
+            rendered = S.zoom; fitWidth = paneW();
+            const first = pages.querySelector(".page");
+            lastPageH = first ? first.offsetHeight / S.zoom : 0;
+            busy(false);
+            bindSwipe();
+        }
+        function pageBox(r, withText) {
+            const box = el("div", "page");
+            box.style.width = r.w + "px"; box.style.height = r.h + "px";
+            r.canvas.style.width = r.w + "px"; r.canvas.style.height = r.h + "px";
+            box.append(r.canvas);
+            if (withText && r.page && window.pdfjsLib) {
+                const text = el("div", "textLayer");
+                text.style.setProperty("--scale-factor", r.vp.scale);
+                box.append(text);
+                r.page.getTextContent().then((tc) => pdfjsLib.renderTextLayer({ textContentSource: tc, container: text, viewport: r.vp, textDivs: [] })).catch(() => { });
+            }
+            return box;
+        }
+        function missingBox(w, h, rev, p) {
+            const box = el("div", "page missing", `No page ${p} in ${esc(rev)}`);
+            box.style.width = w + "px"; box.style.height = h + "px";
+            return box;
+        }
+        function swipeBox(a, b, revA, revB) {
+            const ref = b || a, h = Math.max(a ? a.h : 0, b ? b.h : 0);
+            const box = el("div", "page swipe");
+            box.style.width = ref.w + "px"; box.style.height = h + "px";
+            if (a) { a.canvas.style.width = a.w + "px"; a.canvas.style.height = a.h + "px"; box.append(a.canvas); }
+            if (b) {
+                b.canvas.classList.add("top");
+                b.canvas.style.width = b.w + "px"; b.canvas.style.height = b.h + "px";
+                b.canvas.style.clipPath = `inset(0 0 0 ${S.swipe}%)`;
+                box.append(b.canvas);
+            }
+            box.append(el("span", "stag", esc(revA)));
+            const t = el("span", "stag", esc(revB)); t.style.right = "10px"; box.lastChild.style.left = "10px"; box.append(t);
+            const hd = el("div", "handle"); hd.style.left = S.swipe + "%";
+            hd.tabIndex = 0; hd.setAttribute("role", "slider"); hd.setAttribute("aria-label", "Swipe position");
+            hd.setAttribute("aria-valuemin", "0"); hd.setAttribute("aria-valuemax", "100"); hd.setAttribute("aria-valuenow", String(Math.round(S.swipe)));
+            box.append(hd);
+            return box;
+        }
+        function setSwipe(p) {
+            S.swipe = Math.max(0, Math.min(100, p));
+            pages.querySelectorAll(".swipe").forEach((box) => {
+                const top = box.querySelector("canvas.top"); if (top) top.style.clipPath = `inset(0 0 0 ${S.swipe}%)`;
+                const hd = box.querySelector(".handle"); hd.style.left = S.swipe + "%"; hd.setAttribute("aria-valuenow", String(Math.round(S.swipe)));
+            });
+        }
+        function bindSwipe() {
+            pages.querySelectorAll(".swipe").forEach((box) => {
+                const move = (e) => { const r = box.getBoundingClientRect(); setSwipe((e.clientX - r.left) / r.width * 100); };
+                box.addEventListener("pointerdown", (e) => {
+                    if (e.button !== 0) return;
+                    box.setPointerCapture(e.pointerId); move(e);
+                    const mv = (ev) => move(ev), up = () => { box.removeEventListener("pointermove", mv); box.removeEventListener("pointerup", up); };
+                    box.addEventListener("pointermove", mv); box.addEventListener("pointerup", up);
+                });
+                box.querySelector(".handle").addEventListener("keydown", (e) => {
+                    if (e.key === "ArrowLeft") { setSwipe(S.swipe - 5); e.preventDefault(); }
+                    if (e.key === "ArrowRight") { setSwipe(S.swipe + 5); e.preventDefault(); }
+                });
+            });
+        }
+        function showFallback(v, err, comparing) {
+            rendered = 0;
+            const id = driveId(v.url);
+            const src = id ? `https://drive.google.com/file/d/${encodeURIComponent(id)}/preview` : v.url;
+            viewer.replaceChildren(el("iframe"), el("div", "note",
+                `${comparing ? "Can’t compare" : "Showing the browser’s viewer"}: ${esc(err.message)}.${comparing ? "" : " Zoom and compare need the file to load here."}`));
+            const f = viewer.querySelector("iframe"); f.src = src; f.title = v.rev;
+        }
+
+        /* ================= zoom ================= */
+        function setZoom(next, cx = scroll.clientWidth / 2, cy = scroll.clientHeight / 2) {
+            next = Math.min(6, Math.max(0.2, next));
+            const pct = $("pct"); if (pct) pct.textContent = `${Math.round(next * 100)}%`;
+            if (!rendered) { S.zoom = next; return; }
+            const x = scroll.scrollLeft + cx, y = scroll.scrollTop + cy, f = next / S.zoom;
+            S.zoom = next;
+            pages.style.zoom = String(S.zoom / rendered);
+            scroll.scrollLeft = x * f - cx; scroll.scrollTop = y * f - cy;
+            clearTimeout(renderTimer);
+            renderTimer = setTimeout(async () => { const l = scroll.scrollLeft, t = scroll.scrollTop; await draw(); scroll.scrollLeft = l; scroll.scrollTop = t; }, 180);
+        }
+        async function fitPage() {
+            try {
+                const d = await loadDoc(V[S.view]);
+                const aspect = await pageAspect(d);
+                const perW = S.base !== null && S.mode === "side" ? (paneW() - 16) / 2 : paneW();
+                return Math.min(1, paneH() / (perW * aspect));
+            } catch { return 1; }
+        }
+        scroll.addEventListener("wheel", (e) => {
+            if (!e.ctrlKey && !e.metaKey) return;
+            e.preventDefault();
+            const r = scroll.getBoundingClientRect(), step = Math.max(-25, Math.min(25, e.deltaY));
+            setZoom(S.zoom * Math.exp(-step * 0.01), e.clientX - r.left, e.clientY - r.top);
+        }, { passive: false });
+        let gestureStart = 1;
+        scroll.addEventListener("gesturestart", (e) => { e.preventDefault(); gestureStart = S.zoom; });
+        scroll.addEventListener("gesturechange", (e) => { e.preventDefault(); const r = scroll.getBoundingClientRect(); setZoom(gestureStart * e.scale, e.clientX - r.left, e.clientY - r.top); });
+        let pinch = null;
+        const spread = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+        scroll.addEventListener("touchstart", (e) => { if (e.touches.length === 2) pinch = { d: spread(e.touches), z: S.zoom }; }, { passive: true });
+        scroll.addEventListener("touchmove", (e) => {
+            if (!pinch || e.touches.length !== 2) return;
+            e.preventDefault();
+            const r = scroll.getBoundingClientRect();
+            setZoom(pinch.z * spread(e.touches) / pinch.d, (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left, (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top);
+        }, { passive: false });
+        scroll.addEventListener("touchend", () => { pinch = null; });
+        new ResizeObserver(() => { if (rendered && Math.abs(paneW() - fitWidth) > 4) setZoom(S.zoom); }).observe(scroll);
+
+        /* ================= actions ================= */
+        async function refresh(refit) {
+            renderBar(); renderDrawer();
+            if (refit) { S.zoom = await fitPage(); const p = $("pct"); if (p) p.textContent = `${Math.round(S.zoom * 100)}%`; }
+            await draw();
+        }
+        function startCompare(i) {
+            S.view = i === undefined ? (S.view > 0 ? S.view : latestIndex) : i;
+            S.base = S.view - 1;
+            refresh(true);
+        }
+        document.addEventListener("click", (e) => {
+            const menu = $("more");
+            if (menu && !e.target.closest(".menuwrap")) { menu.hidden = true; }
+            const t = e.target.closest("button"); if (!t) return;
+            const a = t.dataset.act;
+            if (a === "compare") startCompare();
+            else if (a === "done") { S.base = null; refresh(true); }
+            else if (a === "latest") { S.view = CUR; refresh(true); }
+            else if (a === "history") { S.drawer = !S.drawer; renderBar(); renderDrawer(); }
+            else if (a === "fullscreen") toggleFull();
+            else if (a === "more") { const m = $("more"); m.hidden = !m.hidden; t.setAttribute("aria-expanded", String(!m.hidden)); }
+            else if (t.dataset.mode) { S.mode = t.dataset.mode; refresh(true); }
+            else if (t.dataset.z) {
+                const z = t.dataset.z;
+                if (z === "in") setZoom(S.zoom * 1.25); else if (z === "out") setZoom(S.zoom / 1.25);
+                else if (z === "width") setZoom(1); else fitPage().then((f) => setZoom(f));
+            }
+            else if (t.dataset.view !== undefined) { S.view = +t.dataset.view; S.base = null; refresh(true); }
+            else if (t.dataset.cmp !== undefined) startCompare(+t.dataset.cmp);
+        });
+        document.addEventListener("change", (e) => {
+            if (e.target.id === "verSel") {
+                S.view = +e.target.value;
+                if (S.base !== null) { if (S.view === 0) S.base = null; else if (S.base >= S.view) S.base = S.view - 1; }
+                refresh(true);
+            }
+            if (e.target.id === "baseSel") { S.base = +e.target.value; refresh(false); }
+        });
+        /* ================= full screen ================= */
+        // Uses the browser's full screen. Inside an embed that doesn't allow it (iframe without
+        // allow="fullscreen"), it opens the same view in a new tab instead.
+        const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+        async function toggleFull() {
+            const root = document.documentElement;
+            try {
+                if (isFull()) { await (document.exitFullscreen || document.webkitExitFullscreen).call(document); return; }
+                const req = root.requestFullscreen || root.webkitRequestFullscreen;
+                const allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+                if (!req || !allowed) throw new Error("not allowed");
+                await req.call(root);
+            } catch {
+                window.open(location.href, "_blank", "noopener");
+            }
+        }
+        async function onFullChange() {
+            renderBar();
+            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));  // let the layout settle
+            S.zoom = await fitPage(); await draw();
+            const p = $("pct"); if (p) p.textContent = `${Math.round(S.zoom * 100)}%`;
+        }
+        document.addEventListener("fullscreenchange", onFullChange);
+        document.addEventListener("webkitfullscreenchange", onFullChange);
+
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") { if (S.drawer) { S.drawer = false; renderBar(); renderDrawer(); } const m = $("more"); if (m) m.hidden = true; }
+        });
+
+        /* ================= demo data ================= */
+        function demoData() {
+            const svg = (o) => {
+                const k = 9, X = 260, Y = 260, L = 52 * k, W = 30 * k, r = 10 * k, hx = X + o.hx * k, hy = Y + 15 * k, hr = o.d / 2 * k, SX = X + L + 170, t = o.t * k;
+                const txt = (x, y, s, size = 20, a = "middle", extra = "") => `<text x="${x}" y="${y}" font-size="${size}" text-anchor="${a}" ${extra}>${s}</text>`;
+                return `<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1188" viewBox="0 0 1680 1188" font-family="Helvetica, Arial, sans-serif" fill="#1f2530">
+                  <rect width="1680" height="1188" fill="#fff"/><g fill="none" stroke="#1f2530">
+                  <rect x="40" y="40" width="1600" height="1108" stroke-width="2"/>
+                  <path d="M${X + r} ${Y} H${X + L} V${Y + W} H${X + r} A${r} ${r} 0 0 1 ${X} ${Y + W - r} V${Y + r} A${r} ${r} 0 0 1 ${X + r} ${Y} Z" stroke-width="3"/>
+                  <circle cx="${hx}" cy="${hy}" r="${hr}" stroke-width="2.5"/>
+                  ${o.thread ? `<path d="M${hx + 6 * k} ${hy} A${6 * k} ${6 * k} 0 1 1 ${hx} ${hy - 6 * k}" stroke-width="1.2"/>` : ""}
+                  <path d="M${X - 20} ${hy} H${X + L + 20}" stroke-dasharray="24 5 5 5" stroke-width="1"/>
+                  <path d="M${hx} ${hy - hr - 14} V${hy + hr + 14}" stroke-dasharray="24 5 5 5" stroke-width="1"/>
+                  <path d="M${X} ${Y - 70} H${X + L} M${hx} ${Y - 30} H${X + L} M${X} ${Y - 80} V${Y - 4} M${X + L} ${Y - 80} V${Y - 4} M${hx} ${Y - 40} V${hy - hr - 4}" stroke-width="1"/>
+                  <rect x="${SX}" y="${Y}" width="${t}" height="${W}" stroke-width="3"/>
+                  <path d="M${SX} ${hy - hr} H${SX + t} M${SX} ${hy + hr} H${SX + t}" stroke-dasharray="8 5" stroke-width="1.2"/>
+                  <path d="M${SX - 40} ${Y} V${Y + W} M${SX} ${Y - 40} H${SX + t}" stroke-width="1"/>
+                  <path d="M40 870 H1640 M420 870 V1148 M960 870 V1148 M1300 870 V1148" stroke-width="2"/>
+                  <path d="M${hx + hr * .5} ${hy + hr * .87} L${hx + 70} ${Y + W + 70} H${hx + 330}" stroke-width="1.2"/></g>
+                  ${txt(X + L / 2, Y - 78, "52", 22)}${txt((hx + X + L) / 2, Y - 38, o.dim, 22)}
+                  ${txt(SX + t / 2, Y - 48, `(${o.t})`, 22)}${txt(SX - 48, Y + W / 2, "30", 22, "middle", `transform="rotate(-90 ${SX - 48} ${Y + W / 2})"`)}
+                  ${o.callout.map((c, i) => txt(hx + 74, Y + W + 64 + i * 26, c, 19, "start")).join("")}
+                  ${txt(X - 30, Y + W + 60, "R10, 2 PLACES", 18, "end")}
+                  ${txt(230, 1020, "wootz.work", 54, "middle", 'font-weight="700"')}
+                  ${txt(690, 920, "HOLD-DOWN ROLLER 1270", 22, "middle", 'font-weight="700"')}${txt(690, 952, "SCRAPER TENSIONER LUG", 22, "middle", 'font-weight="700"')}
+                  ${txt(440, 1010, `Material: AISI 304 ${o.t}mm PROFILE`, 18, "start")}${txt(440, 1050, `Weight: ${o.wt} kg`, 18, "start")}
+                  ${txt(1320, 910, "REV  DESCRIPTION", 16, "start")}${o.revs.map((rv, i) => txt(1320, 940 + i * 26, rv, 15, "start")).join("")}
+                  ${txt(1130, 1110, "PART # 10221746-003-077", 16)}${txt(1590, 1110, "REV " + o.rev, 26, "end", 'font-weight="700"')}
+                  ${txt(840, 850, "-PERMANENTLY IDENTIFIED WITH PART NUMBER ONCE COMPLETED &amp; ON SUPPLY", 18, "middle", 'font-style="italic"')}
+                </svg>`;
+            };
+            const uri = (s) => "data:image/svg+xml;charset=utf-8," + encodeURIComponent(s);
+            const r0 = svg({ rev: 0, hx: 13.5, d: 10.2, thread: true, dim: "38.5", t: 12, wt: "0.14", callout: ["Ø 10.2 THRU ALL", "M12x1.75 - 6H THRU ALL"], revs: ["0   FIRST ISSUE"] });
+            const r1 = svg({ rev: 1, hx: 12, d: 13, thread: false, dim: "40", t: 10, wt: "0.11", callout: ["Ø 13 THRU ALL"], revs: ["0   FIRST ISSUE", "1   HOLE Ø13 CLR, CTR 40, t10"] });
+            // Same shape as the Glide output, including its quirks, so the demo exercises the repair path
+            const raw = `,{
+"Project": "Unnati 185",
+"Part Number": "10221746-003-077",
+"Uploaded By": "riya.mehta@wootz.work",
+"Time Stamp": "10/28/2026, 11:10:02 AM",
+"Version": "v0",
+"log": "Changes summary: 
+
+Drawing updated (Reason: First issue) ",
+"Drawing": "${uri(r0)}"
+"Approved By": "vikram.shah@wootz.workapproved",
+"Approved Time Stamp": "10/30/2026, 4:10:00 PMapp",
+
+}`;
+            return buildData(readEntries(raw), uri(r1), "", "");
+        }
+
+        /* ================= start ================= */
+        (async function init() {
+            if (!V.length) {
+                $("bar").innerHTML = "";
+                viewer.innerHTML = `<div class="empty">No drawing to show. The link needs <b>?url=</b> followed by the drawing's file URL.<br><a href="?demo=1">See a demo</a></div>`;
+                return;
+            }
+            viewer.replaceChildren(scroll);
+            await refresh(true);
+        })();
+    </script>
+</body>
+
+</html>
