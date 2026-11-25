@@ -19,9 +19,7 @@
          *                     "Approved By":"…","Approved Time Stamp":"…","log":"Changes summary: …"}
          *               old: {"Version":"v0","Previous Drawing":"https://…","By":"…","Time Stamp":"…","log":"…"}
          *             If the current url matches a version's file, it's shown as that version.
-         *             Otherwise it's the current drawing: "Pending approval" when the log has approvals,
-         *             no status for old drawings from before approvals.
-         *   status    optional: the current drawing's approval status from Glide, shown as is.
+         *             Otherwise it's shown as the current drawing.
          *   rev       optional label for the current drawing when it isn't in the log.
          *   proxy     optional CORS proxy prefix; the file URL is appended, encoded.
          *   api       service used for Google Drive links (default: the PO Assemblies service).
@@ -138,19 +136,7 @@
         .ver.viewing .tag { background: var(--primary); color: var(--primary-text); }
         .ver p { margin: 6px 0 0; font-size: 13px; color: #d6d6d8; white-space: pre-wrap; }
         .ver .acts { display: flex; gap: 14px; margin-top: 8px; }
-        .st { font-size: 12px; font-weight: 600; }
-        .pillst { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
-        .pillst::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-        .pillst.ok { color: #3dc46b; background: rgba(61,196,107,.12); }
-        .pillst.pend { color: #f08a4b; background: rgba(240,138,75,.12); }
-        .st.ok { color: #3dc46b; }
-        .st.pend { color: #f08a4b; }
-        .st.bad { color: #ef6b5b; }
-        .st.neutral { color: var(--muted); font-weight: 500; }
-        .pillst.bad { color: #ef6b5b; background: rgba(239,107,91,.12); }
-        .pillst.neutral { color: var(--muted); background: #2a2a2e; }
         .ver .up { font-size: 12px; color: var(--faint); margin-top: 4px; }
-        .sub .st { margin-left: 6px; }
         .log { display: flex; gap: 10px; padding: 8px 0; font-size: 13px; }
         .log .when { color: var(--faint); font-size: 12px; white-space: nowrap; min-width: 86px; }
         .log .what { color: #d6d6d8; white-space: pre-wrap; }
@@ -455,17 +441,6 @@
         const latestIndex = V.length - 1;
         const CUR = DATA.currentIndex;
         const label = (i) => V[i].rev + (i === CUR && V[i].rev !== "Current" ? " (current)" : "");
-        // Status of a version: { cls, short (for the toolbar pill), long (for history) }
-        function statusOf(v) {
-            if (v.current && v.statusText) {
-                const t = v.statusText, cls = /chang/i.test(t) ? "bad" : (/approv/i.test(t) && !/(un|not|await|pend)/i.test(t)) ? "ok" : "pend";
-                return { cls, short: t, long: `<span class="st ${cls}">${esc(t)}</span>` };
-            }
-            if (v.approved) return { cls: "ok", short: "Approved", long: `<span class="st ok">Approved${v.approvedAt ? " " + esc(niceDate(v.approvedAt)) : ""}${v.approvedBy ? " by " + esc(v.approvedBy) : ""}</span>` };
-            if (v.current && !DATA.legacy) return { cls: "pend", short: "Pending approval", long: `<span class="st pend">Pending approval</span>` };
-            if (v.current) return { cls: "", short: "", long: "" };
-            return { cls: "neutral", short: "Earlier version", long: `<span class="st neutral">Earlier version</span>` };
-        }
         const uploadedLine = (v) => v.uploadedAt || v.uploadedBy ? `Uploaded${v.uploadedAt ? " " + esc(niceDate(v.uploadedAt)) : ""}${v.uploadedBy ? " by " + esc(v.uploadedBy) : ""}` : "";
 
         /* ================= toolbar ================= */
@@ -490,7 +465,6 @@
             if (S.base === null) {
                 const vv = V[S.view];
                 bar.innerHTML = `<span class="sel"><select id="verSel" aria-label="Version">${opts(S.view, 0, latestIndex)}</select></span>
-                    ${statusOf(vv).short ? `<span class="pillst ${statusOf(vv).cls}">${esc(statusOf(vv).short)}</span>` : ""}
                     ${multi ? `<button class="btn" data-act="compare">${ic("compare")}${S.view > 0 ? "Compare with " + esc(V[S.view - 1].rev) + (!V[S.view].approved && V[S.view - 1].approved ? '<span class="hide-sm" style="font-weight:400;color:var(--muted)">, last approved</span>' : "") : "Compare versions"}</button>` : ""}${zoom}`;
             } else {
                 bar.innerHTML = `<span class="sel"><select id="verSel" aria-label="Version">${opts(S.view, 1, latestIndex)}</select></span>
@@ -508,7 +482,7 @@
             if (S.base === null) {
                 if (S.view !== CUR) {
                     sub.hidden = false;
-                    sub.innerHTML = `<span>You’re viewing ${esc(V[S.view].rev)}, an older version. ${statusOf(V[S.view]).long}</span><button class="lnk" data-act="latest">View current drawing</button>`;
+                    sub.innerHTML = `<span>You’re viewing ${esc(V[S.view].rev)}, an older version.</span><button class="lnk" data-act="latest">View current drawing</button>`;
                 } else { sub.hidden = true; sub.innerHTML = ""; }
                 return;
             }
@@ -526,14 +500,15 @@
             d.classList.toggle("open", S.drawer);
             if (!S.drawer) return;
             const items = DATA.history.map((v) => {
-                const i = V.indexOf(v), st = statusOf(v), up = uploadedLine(v);
+                const i = V.indexOf(v), up = uploadedLine(v);
+                const appr = v.approved && (v.approvedBy || v.approvedAt) ? `Approved${v.approvedAt ? " " + esc(niceDate(v.approvedAt)) : ""}${v.approvedBy ? " by " + esc(v.approvedBy) : ""}` : "";
                 const acts = i < 0 ? '<span style="font-size:12.5px;color:var(--faint)">No file attached to this version</span>'
                     : `${i === S.view && S.base === null ? '<span style="font-size:12.5px;color:var(--faint)">Viewing</span>' : `<button class="lnk" data-view="${i}">View</button>`}
                        ${i > 0 ? `<button class="lnk" data-cmp="${i}">Compare with ${esc(V[i - 1].rev)}</button>` : ""}`;
                 return `<div class="ver ${i === S.view ? "viewing" : ""}">
                     <div class="vh"><span class="tag">${esc(v.rev)}</span>${v.current && v.rev !== "Current" ? '<span style="font-size:12px;color:var(--muted)">Current</span>' : ""}
-                      <span class="meta">${st.long}</span></div>
-                    ${up ? `<div class="up">${up}</div>` : ""}
+</div>
+                    ${up ? `<div class="up">${up}</div>` : ""}${appr ? `<div class="up">${appr}</div>` : ""}
                     ${v.note ? `<p>${esc(v.note)}</p>` : ""}
                     <div class="acts">${acts}</div></div>`;
             }).join("");
