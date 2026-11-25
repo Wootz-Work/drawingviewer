@@ -5,7 +5,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Drawing</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
     <style>
         /*
          * Drawing viewer with version history and comparison. Embed in Glide with a Web Embed component.
@@ -111,6 +111,7 @@
         .page { position: relative; background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.45); user-select: none; }
         .page canvas { display: block; }
         .page .top { position: absolute; left: 0; top: 0; }
+        .page.lazy { background: #f4f4f4; box-shadow: none; }
         .missing { display: grid; place-items: center; color: #777; font-size: 13px; background: #f4f4f4; }
         .handle { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px solid var(--primary); cursor: ew-resize; z-index: 3; }
         .handle::after { content: ""; position: absolute; top: 50%; left: -14px; width: 26px; height: 26px; margin-top: -13px; border-radius: 50%; background: var(--primary); box-shadow: 0 2px 8px rgba(0,0,0,.4); }
@@ -339,7 +340,23 @@
         function canvasOf(w, h) { const c = document.createElement("canvas"); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; }
 
         /* ================= loading files ================= */
-        if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        // The PDF library is loaded only when a PDF is opened, so the page appears straight away
+        const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+        let pdfjsPromise = null;
+        function ensurePdfjs() {
+            if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+            if (!pdfjsPromise) {
+                pdfjsPromise = new Promise((ok, bad) => {
+                    const sc = document.createElement("script");
+                    sc.src = PDFJS + "pdf.min.js"; sc.async = true;
+                    sc.onload = () => { pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.js"; ok(pdfjsLib); };
+                    sc.onerror = () => { pdfjsPromise = null; bad(new Error("the PDF library didn't load")); };
+                    document.head.append(sc);
+                });
+            }
+            return pdfjsPromise;
+        }
+        const looksLikeImage = (u) => /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/i.test(u) || /^data:image\//.test(u);
 
         function driveId(u) {
             if (!/(drive|docs)\.google\.com/.test(u)) return null;
@@ -380,11 +397,12 @@
         function loadDoc(v) {
             if (!docCache.has(v.url)) {
                 const p = (async () => {
+                    const lib = looksLikeImage(v.url) ? null : ensurePdfjs().catch(() => null);  // fetch the library and the file together
                     const { data, declared } = await fetchBytes(v.url);
                     const type = sniffType(new Uint8Array(data, 0, Math.min(1024, data.byteLength)), declared);
                     if (type === "application/pdf") {
-                        if (!window.pdfjsLib) throw new Error("the PDF library didn't load");
-                        const pdf = await pdfjsLib.getDocument({ data }).promise;
+                        if (!(await (lib || ensurePdfjs().catch(() => null)))) throw new Error("the PDF library didn't load");
+                        const pdf = await pdfjsLib.getDocument({ data, isEvalSupported: false }).promise;
                         return { type: "pdf", pdf, pages: pdf.numPages };
                     }
                     if (type && type.startsWith("image/")) {
@@ -404,12 +422,16 @@
             const vp = (await doc.pdf.getPage(n)).getViewport({ scale: 1 });
             return vp.height / vp.width;
         }
+        // Keeps each canvas under ~12 megapixels, however far you zoom in (browsers slow down and run out of memory beyond that)
+        const MAX_PIXELS = 12e6;
+        function capRatio(w, h, ratio) { return Math.max(0.25, Math.min(ratio, Math.sqrt(MAX_PIXELS / Math.max(1, w * h)))); }
         // Renders page n at a CSS width; returns a white-backed canvas at device resolution
         async function renderPage(doc, n, cssW) {
             if (n > doc.pages) return null;
-            const ratio = window.devicePixelRatio || 1;
+            let ratio = Math.min(window.devicePixelRatio || 1, 2);   // sharp on Retina, but no more than 2x
             if (doc.type === "image") {
                 const cssH = cssW * doc.img.naturalHeight / doc.img.naturalWidth;
+                ratio = capRatio(cssW, cssH, ratio);
                 const c = canvasOf(cssW * ratio, cssH * ratio), ctx = c.getContext("2d");
                 ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
                 ctx.drawImage(doc.img, 0, 0, c.width, c.height);
@@ -418,35 +440,18 @@
             const page = await doc.pdf.getPage(n);
             const base = page.getViewport({ scale: 1 });
             const vp = page.getViewport({ scale: cssW / base.width });
+            ratio = capRatio(vp.width, vp.height, ratio);
             const c = canvasOf(vp.width * ratio, vp.height * ratio), ctx = c.getContext("2d");
             ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
             await page.render({ canvasContext: ctx, viewport: vp, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : null }).promise;
             return { canvas: c, w: vp.width, h: vp.height, page, vp };
         }
-        // Recolours dark ink to `color`, keeping white white
-        function tint(src, color) {
-            const c = canvasOf(src.width, src.height), ctx = c.getContext("2d");
-            ctx.drawImage(src, 0, 0);
-            ctx.globalCompositeOperation = "lighten";
-            ctx.fillStyle = color; ctx.fillRect(0, 0, c.width, c.height);
-            return c;
-        }
-        // Old in red, new in blue, multiplied: lines in both come out dark
-        function overlay(a, b) {
-            const w = Math.max(a ? a.width : 0, b ? b.width : 0), h = Math.max(a ? a.height : 0, b ? b.height : 0);
-            const c = canvasOf(w, h), ctx = c.getContext("2d");
-            ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
-            if (a) ctx.drawImage(tint(a, "#d6453d"), 0, 0);
-            if (b) { ctx.globalCompositeOperation = "multiply"; ctx.drawImage(tint(b, "#2f6fdb"), 0, 0); }
-            return c;
-        }
-
         /* ================= state ================= */
         // Demo: ?demo=1, or the file opened straight from disk with no ?url= (handy for a quick look)
         const DEMO = !!params.get("demo") || (!params.get("url") && !params.get("versions") && location.protocol === "file:");
         const DATA = DEMO ? demoData() : readInput();
         const V = DATA.versions;
-        const S = { view: DATA.currentIndex, base: null, mode: "swipe", zoom: 1, swipe: 50, drawer: false, fit: true };  // fit: keep the whole page in view
+        const S = { view: DATA.currentIndex, base: null, mode: "side", zoom: 1, swipe: 50, drawer: false, fit: true };  // fit: keep the whole page in view
         const latestIndex = V.length - 1;
         const CUR = DATA.currentIndex;
         const label = (i) => V[i].rev + (i === CUR && V[i].rev !== "Current" ? " (current)" : "");
@@ -492,7 +497,7 @@
                     <span class="vs">vs</span>
                     <span class="sel"><select id="baseSel" aria-label="Compare with">${opts(S.base, 0, S.view - 1)}</select></span>
                     <span class="seg" role="group" aria-label="Compare mode">
-                      ${[["side", "Side by side"], ["overlay", "Overlay"], ["swipe", "Swipe"]].map(([k, l]) => `<button data-mode="${k}" aria-pressed="${S.mode === k}">${l}</button>`).join("")}
+                      ${[["side", "Side by side"], ["swipe", "Swipe"]].map(([k, l]) => `<button data-mode="${k}" aria-pressed="${S.mode === k}">${l}</button>`).join("")}
                     </span>
                     <button class="btn" data-act="done">Done</button>${zoom}`;
             }
@@ -509,8 +514,7 @@
             }
             const notes = [];
             for (let i = S.base + 1; i <= S.view; i++) if (V[i].note) notes.push(`<span class="n"><b>${esc(V[i].rev)}</b>${esc(V[i].note)}</span>`);
-            const legend = S.mode === "overlay" ? `<span class="legend"><span><i class="sw" style="background:var(--old)"></i>Only in ${esc(V[S.base].rev)}</span><span><i class="sw" style="background:var(--new)"></i>Only in ${esc(V[S.view].rev)}</span><span><i class="sw" style="background:#222;outline:1px solid #555"></i>In both</span></span>`
-                : S.mode === "swipe" ? `<span>Drag the handle to wipe between ${esc(V[S.base].rev)} and ${esc(V[S.view].rev)}.</span>` : "";
+            const legend = S.mode === "swipe" ? `<span>Drag the handle to wipe between ${esc(V[S.base].rev)} and ${esc(V[S.view].rev)}.</span>` : "";
             sub.hidden = false;
             sub.innerHTML = `${notes.length ? `<div class="notes">${notes.join("")}</div>` : ""}${legend}`;
             if (!notes.length && !legend) { sub.hidden = true; sub.innerHTML = ""; }
@@ -541,7 +545,7 @@
         const viewer = $("viewer");
         const scroll = el("div", "scroll"), pages = el("div", "pages");
         scroll.append(pages);
-        let rendered = 0, drawToken = 0, renderTimer = null, fitWidth = 0, lastPageH = 0;
+        let rendered = 0, drawToken = 0, renderTimer = null, fitWidth = 0, lastPageH = 0, lazyObs = null;
         const paneW = () => Math.max(200, scroll.clientWidth - 32);
         const paneH = () => Math.max(200, scroll.clientHeight - 32);
         function busy(on, text = "Rendering…") {
@@ -567,45 +571,52 @@
             if (token !== drawToken) return;
             if (!viewer.contains(scroll)) viewer.replaceChildren(scroll);
 
-            const out = [];
-            const n = Math.max(dView.pages, dBase ? dBase.pages : 0);
-            if (!vBase) {
-                const w = paneW() * S.zoom;
-                for (let p = 1; p <= dView.pages; p++) {
-                    const r = await renderPage(dView, p, w);
-                    if (token !== drawToken) return;
-                    out.push(pageBox(r, true));
-                }
-            } else if (S.mode === "side") {
-                const w = (paneW() - 16) / 2 * S.zoom;
-                for (let p = 1; p <= n; p++) {
-                    const [a, b] = await Promise.all([renderPage(dBase, p, w), renderPage(dView, p, w)]);
-                    if (token !== drawToken) return;
+            const n = vBase ? Math.max(dView.pages, dBase.pages) : dView.pages;
+            const side = !!vBase && S.mode === "side";
+            const w = side ? (paneW() - 16) / 2 * S.zoom : paneW() * S.zoom;
+            // Builds the element(s) for page p
+            const build = async (p) => {
+                if (!vBase) return pageBox(await renderPage(dView, p, w), true);
+                const [a, b] = await Promise.all([renderPage(dBase, p, w), renderPage(dView, p, w)]);
+                if (side) {
                     const row = el("div", "row");
-                    [[a, vBase, dBase], [b, vView, dView]].forEach(([r, v]) => {
+                    [[a, vBase], [b, vView]].forEach(([r, v]) => {
                         const cell = el("div", "cell");
                         if (p === 1) cell.append(el("div", "cap", `<span class="tag">${esc(v.rev)}</span>${esc(niceDate(v.date))}`));
                         cell.append(r ? pageBox(r) : missingBox(w, (a || b).h, v.rev, p));
                         row.append(cell);
                     });
-                    out.push(row);
+                    return row;
                 }
-            } else {
-                const w = paneW() * S.zoom;
-                for (let p = 1; p <= n; p++) {
-                    const [a, b] = await Promise.all([renderPage(dBase, p, w), renderPage(dView, p, w)]);
-                    if (token !== drawToken) return;
-                    const ref = b || a;
-                    if (S.mode === "overlay") {
-                        const c = overlay(a && a.canvas, b && b.canvas);
-                        out.push(pageBox({ canvas: c, w: ref.w, h: Math.max(a ? a.h : 0, b ? b.h : 0) }));
-                    } else {
-                        out.push(swipeBox(a, b, vBase.rev, vView.rev));
-                    }
+                const ref = b || a;
+                return swipeBox(a, b, vBase.rev, vView.rev);
+            };
+            const firstEl = await build(1);
+            if (token !== drawToken) return;
+            const out = [firstEl];
+            // Later pages: a placeholder the size of page 1, rendered only when it scrolls near the view
+            if (lazyObs) lazyObs.disconnect();
+            if (n > 1) {
+                lazyObs = new IntersectionObserver((entries) => entries.forEach(async (e) => {
+                    if (!e.isIntersecting) return;
+                    const slot = e.target; lazyObs.unobserve(slot);
+                    const real = await build(+slot.dataset.page);
+                    if (token === drawToken && slot.isConnected) { slot.replaceWith(real); bindSwipe(); }
+                }), { root: scroll, rootMargin: "600px 0px" });
+                for (let p = 2; p <= n; p++) {
+                    const slot = el("div", "page lazy");
+                    slot.dataset.page = String(p);
+                    out.push(slot);
                 }
             }
             pages.replaceChildren(...out);
             pages.style.zoom = "";
+            const firstBox = out[0].classList.contains("page") ? out[0] : out[0].querySelector(".page");
+            out.slice(1).forEach((slot) => {
+                const fw = (firstBox || out[0]).offsetWidth, fh = (firstBox || out[0]).offsetHeight;
+                slot.style.width = (side ? out[0].offsetWidth : fw) + "px"; slot.style.height = fh + "px";
+                lazyObs.observe(slot);
+            });
             rendered = S.zoom; fitWidth = paneW();
             const first = pages.querySelector(".page");
             lastPageH = first ? first.offsetHeight / S.zoom : 0;
@@ -621,7 +632,8 @@
                 const text = el("div", "textLayer");
                 text.style.setProperty("--scale-factor", r.vp.scale);
                 box.append(text);
-                r.page.getTextContent().then((tc) => pdfjsLib.renderTextLayer({ textContentSource: tc, container: text, viewport: r.vp, textDivs: [] })).catch(() => { });
+                const later = window.requestIdleCallback || ((f) => setTimeout(f, 200));
+                later(() => r.page.getTextContent().then((tc) => pdfjsLib.renderTextLayer({ textContentSource: tc, container: text, viewport: r.vp, textDivs: [] })).catch(() => { }));
             }
             return box;
         }
